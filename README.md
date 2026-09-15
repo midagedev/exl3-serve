@@ -14,8 +14,14 @@ process protocol, so the model has to live in a Python process. This module
 is that process plus about two hundred lines of HTTP; anything larger belongs
 outside it.
 
-Status: second cut — `/props` engine block, token-exact streaming, sampler
-and timings from the engine's own results. See `docs/` once it exists.
+Status: it serves, and it has been recorded. On a two-card workstation
+(RTX A6000 48 GB + RTX 3090 24 GB, Threadripper PRO 5975WX, 252 GB DDR4-3600)
+it served GLM-5.3-Flash EXL3 4.05 bpw — 154 GiB, per-expert placement with
+`-mcs 185`, the MTP layer as its own draft — and toktape attached to it and
+recorded 22.0 tok/s decode with the draft 96 % accepted, naming the engine
+`exllamav3 1.5.0` rather than a llama-server build number. The numbers, the
+tape and the clip are in that machine's log:
+[rig-log 2026-09-15](https://github.com/midagedev/rig-log/blob/main/log/2026-09-15-exl3-serve-and-tabbyapi-timings.md).
 
 ## Usage
 
