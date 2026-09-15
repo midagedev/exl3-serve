@@ -816,8 +816,8 @@ class _Generation:
                 await send(self._chunk(delta=delta, extra=extra))
 
         await send(self._chunk(delta={"role": "assistant", "content": ""}))
-        await self._drive(emit)
         try:
+            await self._drive(emit)
             if self.engine_error is not None:
                 await send({"error": {"code": 500, "message": self.engine_error,
                                       "type": "server_error"}})
@@ -833,8 +833,24 @@ class _Generation:
                 final["usage"] = self._usage()
             await send(final)
             await resp.write(b"data: [DONE]\n\n")
-        except (ConnectionResetError, asyncio.CancelledError):
+        except asyncio.CancelledError:
+            # never swallowed; _drive's finally owns the fire-and-forget
+            # cleanup for the cancelled-handler configuration
             raise
+        except ConnectionResetError:
+            # the client went away mid-stream (production runs without
+            # handler_cancellation, so nobody cancels this handler for us).
+            # Cancel the job through the dispatcher -- the same call the
+            # stop-sequence path makes -- and stop writing to the dead
+            # socket: one log line, no traceback. The slot is released by
+            # handle_chat's finally, exactly like a normal completion.
+            job = self.rec.job
+            if self.figures is None and job is not None:
+                with contextlib.suppress(Exception):
+                    await self.st.dispatcher.cancel(job)
+                    await self.st.dispatcher.purge(job)
+                print(f"exl3-serve: client gone after {self.emitted} tokens, "
+                      "job cancelled", flush=True)
         return resp
 
     # -- blocking response ------------------------------------------------------

@@ -40,12 +40,15 @@ the tests that pin it (>= 2 assertions per clause where meaningful):
 | model field ignored and echoed back | test_model_field_echoed |
 | 503 with the loading error shape on completions while loading | test_health_loading_503 |
 | Self-review defect classes: client disconnect (slot/job cleanup), stop string spanning tokens, unterminated think block | test_client_disconnect_frees_slot_and_cancels_job, test_stop_string_across_token_boundary, test_think_split_unterminated |
+| Disconnect under the production runner (no handler_cancellation): job cancelled via dispatcher, slot freed, one log line, no traceback | test_client_disconnect_production_runner_cancels_job_quietly |
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -870,6 +873,46 @@ async def test_client_disconnect_frees_slot_and_cancels_job():
                                 "stream": True})
         assert ev[-1] == "[DONE]"  # slot freed: the server still serves
         await asyncio.sleep(0.05)  # let the fire-and-forget cleanup settle
+
+
+async def test_client_disconnect_production_runner_cancels_job_quietly(caplog, capsys):
+    # Production shape: web.run_app does NOT enable handler_cancellation (the
+    # serve() helper above does, which is why the test above could pass while
+    # the real server logged a traceback). Without cancellation, the disconnect
+    # surfaces as a write error inside _drive -- the stream itself must cancel
+    # the job through the dispatcher, free the slot, and log one line.
+    eng = FakeEngine(script="I " * 100, delay=0.02)  # a full run is > 2 s of sleeps
+    app = create_app(Options(), engine=eng)
+    runner = web.AppRunner(app)  # no handler_cancellation, like web.run_app
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = runner.addresses[0][1]
+    caplog.set_level(logging.ERROR, logger="aiohttp.server")
+    try:
+        async with ClientSession(base_url=f"http://127.0.0.1:{port}") as client:
+            resp = await client.post("/v1/chat/completions",
+                                     json={"messages": USER, "stream": True})
+            assert resp.status == 200
+            await resp.content.readline()  # first event flushed before we go away
+            resp.close()                   # the client disconnects mid-stream
+            for _ in range(60):            # 1.2 s max, well under a full 2 s run
+                if eng.num_remaining_jobs() == 0:
+                    break
+                await asyncio.sleep(0.02)
+            assert eng.num_remaining_jobs() == 0, \
+                "job still generating after the client went away"
+            s = await (await client.get("/slots")).json()
+            assert all(x["is_processing"] is False for x in s), "slot not released"
+    finally:
+        await runner.cleanup()
+    assert "Error handling request" not in caplog.text, \
+        "the disconnect escaped the handler as a traceback"
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if "client gone" in ln]
+    assert len(lines) == 1, f"expected exactly one disconnect line, got: {lines!r}"
+    assert re.fullmatch(r"exl3-serve: client gone after \d+ tokens, job cancelled",
+                        lines[0])
 
 
 # ---------------------------------------------------------------- packaging

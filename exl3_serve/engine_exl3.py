@@ -16,6 +16,16 @@ tools/exl3/exl3-probe.py):
   per token, the last one carrying ``eos`` plus the timing figures.
 - ``Generator.__init__`` takes ``num_draft_tokens``/``dynamic_draft_tokens``;
   ``Generator.cancel(job)`` exists.
+- ``model_init`` builds every cache with ``max_batch_size =
+  args.autosplit_max_batch_size`` (the ``-ambs`` flag, default 1),
+  ``cache.num_slots`` is that number, and ``Generator.__init__`` clamps its
+  batch to ``cache.num_slots`` -- so ``--parallel`` above ``-ambs`` silently
+  serializes unless load raises ``-ambs`` first (defect measured 2026-09-15;
+  model_init.py:292, cache.py:161, generator.py:233 of v1.5.0).
+- ``tokenizer.encode`` returns a ``[1, N]`` long tensor whose ``len()`` is 1
+  (tokenizer.py:420); ``Job(input_ids=...)`` takes a ``[1, N]`` CPU tensor
+  (job.py:49, :146, :206). encode flattens to the Protocol's list, submit
+  converts back in one place.
 - the client-facing version is ``exllamav3.version.__version__`` ("1.5.0");
   the wheel's importlib.metadata string carries a local-version suffix
   ("1.5.0+cu128.torch2.10.0") and must not be used.
@@ -205,6 +215,16 @@ class Exl3Engine:
         except Exception:
             version = None
 
+        parallel = getattr(args, "parallel", 2) or 2
+        # model_init sizes the cache from args.autosplit_max_batch_size (the
+        # -ambs flag, default 1) and the Generator clamps its batch to the
+        # cache's slot count, so a default cache silently serializes
+        # --parallel streams. Raise the cache's slots to at least --parallel;
+        # a larger -ambs the user typed is never shrunk.
+        ambs = getattr(args, "autosplit_max_batch_size", None)
+        if not isinstance(ambs, int) or ambs < parallel:
+            args.autosplit_max_batch_size = parallel
+
         r = model_init.init(args, progress=False, quiet=True)
         model, config, cache, tokenizer = r[:4]
         draft_model = draft_cache = None
@@ -213,10 +233,18 @@ class Exl3Engine:
         gen = Generator(
             model=model, cache=cache, tokenizer=tokenizer,
             draft_model=draft_model, draft_cache=draft_cache,
-            max_batch_size=getattr(args, "parallel", 2) or 2,
+            max_batch_size=parallel,
             num_draft_tokens=getattr(args, "draft_n", None),
             dynamic_draft_tokens=bool(getattr(args, "dyn_draft", False)),
         )
+        served = getattr(gen, "max_batch_size", parallel)
+        if served < parallel:
+            # Failing loudly at load beats a server that reports N free slots
+            # and serializes every stream through a one-slot batch.
+            raise RuntimeError(
+                f"exl3-serve: --parallel {parallel} but the generator clamped "
+                f"to {served} (cache slots {getattr(cache, 'num_slots', '?')}); "
+                "raise -ambs")
         tpl_path = os.path.join(args.model_dir, "chat_template.jinja")
         if not os.path.isfile(tpl_path):
             raise FileNotFoundError(f"chat template not found: {tpl_path}")
@@ -287,7 +315,24 @@ class Exl3Engine:
         return self.template.render(messages=messages, **kw)
 
     def encode(self, text: str) -> list[int]:
-        return self.tokenizer.encode(text, encode_special_tokens=True)
+        # exllamav3's encode returns a [1, N] tensor; the Protocol hands out
+        # the flat list the HTTP layer counts tokens with (len() of the tensor
+        # would be the batch dimension, 1).
+        ids = self.tokenizer.encode(text, encode_special_tokens=True)
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return [int(i) for i in ids]
+
+    @staticmethod
+    def _job_input_ids(ids: Any) -> Any:
+        """Job takes a [1, N] CPU long tensor (job.py asserts the shape and
+        the device); everything else in the module speaks the flat list."""
+        if isinstance(ids, list):
+            import torch
+            return torch.tensor([ids], dtype=torch.long)
+        return ids
 
     def submit(self, ids: list[int], max_new_tokens: int,
                sampling: Optional[dict], stop: Optional[list[str]]) -> Any:
@@ -313,7 +358,7 @@ class Exl3Engine:
         if not stops and self.tokenizer.eos_token_id is not None:
             stops = [self.tokenizer.eos_token_id]
         job = Job(
-            input_ids=ids,
+            input_ids=self._job_input_ids(ids),
             max_new_tokens=max_new_tokens,
             sampler=sampler,
             stop_conditions=stops or None,
