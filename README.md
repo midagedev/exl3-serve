@@ -91,7 +91,7 @@ how the HTTP layer is smoke-tested offline.
 - `timings` object (on the final chunk always; on content chunks too when
   `timings_per_token`): `prompt_n` (prompt tokens **minus** cached),
   `prompt_ms`, `prompt_per_second` (over `prompt_n`), `predicted_n`,
-  `predicted_ms`, `predicted_per_second` (over `predicted_n − 1`, as llama-server: the engine times first token to last), `cache_n` (the engine's
+  `predicted_ms`, `predicted_per_second`, `cache_n` (the engine's
   `cached_tokens`; omitted when the engine does not report it), plus
   `draft_n`/`draft_n_accepted` only when the engine reports draft counters.
   Final-chunk figures come from the engine's own eos result — never from wall

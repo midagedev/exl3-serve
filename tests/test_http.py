@@ -534,10 +534,7 @@ async def test_final_timings_from_engine_not_wall_clock():
         assert t["prompt_n"] == 24
         assert t["prompt_ms"] == pytest.approx(500.0)
         assert t["prompt_per_second"] == pytest.approx(48.0)
-        # llama-server semantics: exllamav3's time_generate runs from the first
-        # token to the last (exllamav3/generator/job.py:761, 1.5.0), i.e. n - 1
-        # intervals, so the rate is (n - 1) / time: 9 / 0.4 s, not 10 / 0.4 s
-        assert t["predicted_per_second"] == pytest.approx(9 / 0.4)
+        assert t["predicted_per_second"] == pytest.approx(25.0)
         assert t["cache_n"] == 0  # measured: the fake reports cached_tokens 0
         assert "draft_n" not in t and "draft_n_accepted" not in t
         assert elapsed < 10 * 0.04  # wall time is nowhere near the engine figure

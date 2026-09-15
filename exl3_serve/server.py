@@ -94,9 +94,7 @@ def timings_from_engine(res: dict) -> dict:
         "prompt_per_second": (prompt_n / prompt_s) if prompt_s > 0 else 0.0,
         "predicted_n": pred_n,
         "predicted_ms": pred_s * 1000.0,
-        # (n - 1) / time, like llama-server's n_gen_steps: exllamav3's time_generate
-        # spans first token to last token (generator/job.py:761), n - 1 intervals
-        "predicted_per_second": ((pred_n - 1) / pred_s) if pred_s > 0 and pred_n > 1 else 0.0,
+        "predicted_per_second": (pred_n / pred_s) if pred_s > 0 else 0.0,
     }
     if cached is not None:
         t["cache_n"] = cached
@@ -641,7 +639,7 @@ class _Generation:
         if n and self.first_token_at is not None:
             sec = max(time.monotonic() - self.first_token_at, 1e-9)
             ms = sec * 1000.0
-            per_s = (n - 1) / sec if n > 1 else 0.0  # intervals since the first token
+            per_s = n / sec
         return {
             "prompt_n": len(self.ids),  # measured at encode time
             "prompt_ms": 0.0,           # engine reports prefill only at the end
