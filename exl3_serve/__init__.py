@@ -1,5 +1,12 @@
 """exl3-serve: a llama-server-compatible HTTP front for ExLlamaV3."""
-from importlib.metadata import PackageNotFoundError, version
+import os
+
+# Must be set before exllamav3 (and therefore torch) is imported anywhere in
+# this process, so cuda:<n> device names match nvidia-smi's indices -- the
+# /props placement reports GPU<n> with that numbering.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+from importlib.metadata import PackageNotFoundError, version  # noqa: E402
 
 try:
     __version__ = version("exl3-serve")

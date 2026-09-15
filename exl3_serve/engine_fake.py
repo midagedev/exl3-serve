@@ -1,29 +1,49 @@
 """Deterministic fake engine: the whole HTTP layer is testable without a GPU.
 
+It mirrors the measured exllamav3 1.5.0 ``Generator.iterate()`` result shape
+(rig-log probe 2026-09-15): per job, two text-less prefill results first (the
+second carrying ``curr_progress``/``max_progress``), then **one result per
+token** with ``text`` and one-element ``token_ids``, the final one riding the
+last token together with ``eos``, ``eos_reason`` and the timing figures.
+Scripted tokens are word-sized (``<think>``/``</think>`` are single tokens),
+so token-boundary behaviour is exercised the way the real tokenizer produces
+it.
+
 Behaviour contracts the test suite relies on:
 
-- ``render_chat`` concatenates the messages in a chatml-ish shape (and always
-  ends with the assistant generation prompt).
-- ``encode`` maps each whitespace-separated word to a stable fake token id and
-  remembers the mapping, so the engine can decode a prompt back to its words.
-- ``submit`` derives the scripted reply from the prompt's user message unless
-  ``script`` was pinned at construction -- distinct prompts therefore get
-  distinct scripts, which is what the stream-isolation tests rely on.
-- ``iterate`` emits **one character per call per active job** (so ``<think>``
-  tags necessarily arrive split across token boundaries, like real
-  detokenized deltas), sleeping ``delay`` seconds once per call to emulate
-  decode latency, and the last token rides on the final result together with
-  the fixed timing figures, mirroring the exllamav3 Job result shape.
-- ``cancel`` makes the next ``iterate`` produce a final result with figures
-  for the tokens emitted so far (what the real engine does on its good days).
+- ``render_chat`` concatenates the messages chatml-ish and ends with
+  ``<|assistant|><think>`` when constructed with ``think_prompt=True``
+  (default) -- like the target model's template -- so the reply opens inside
+  a think block. The default script accordingly starts with reasoning and
+  contains ``</think>`` but never ``<think>``.
+- ``encode`` maps each whitespace-separated word to a stable fake token id,
+  so the engine can decode a prompt back to its words; ``submit`` derives
+  the scripted reply from the prompt's user message unless ``script`` was
+  pinned -- distinct prompts get distinct scripts (stream isolation tests).
+- ``iterate`` advances every active job one step per call (prefill, prefill
+  with progress, then one token per call), sleeping ``delay`` seconds once
+  per call to emulate decode latency.
+- ``cached_tokens`` (default 0) and ``draft_stats`` ride the final result;
+  ``prefill_progress`` overrides the default (60% of the prompt, whole
+  prompt) progress figures.
+- ``cancel`` makes the next ``iterate`` produce a figures-only final result.
 - ``fail_on_token`` injects an exception mid-generation, for the error paths.
+- ``props["engine"]`` is a fixed engine block (name, version, args from the
+  constructor or ``sys.argv[1:]``, a model block computed by engine_info
+  when the model dir exists, no placement). The ``exllamav3_version`` prop
+  stays None: no exllamav3 is installed here, so the Server header keeps
+  saying ``unknown`` -- the block's version is a scripted fixture, not a
+  measurement.
 """
 from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from typing import Any, Optional
+
+from . import engine_info
 
 # A built-in minimal template so `--fake` needs no files on disk.
 MINIMAL_CHAT_TEMPLATE = (
@@ -32,44 +52,75 @@ MINIMAL_CHAT_TEMPLATE = (
     "{%- endfor %}{{ '<|assistant|>\\n' }}"
 )
 
+_TAG_RE = re.compile(r"(<think>|</think>)")
+_WORD_RE = re.compile(r"\s*\S+|\s+")
+
+
+def tokenize(text: str) -> list[str]:
+    """Word-sized tokens with the think tags as single tokens; leading
+    spaces stay attached to their word (how the real detokenizer emits)."""
+    out: list[str] = []
+    for piece in _TAG_RE.split(text):
+        if piece in ("<think>", "</think>"):
+            out.append(piece)
+        else:
+            out.extend(_WORD_RE.findall(piece))
+    return [t for t in out if t]
+
 
 class FakeJob:
-    __slots__ = ("tokens", "index", "cancelled", "final_sent")
+    __slots__ = ("tokens", "index", "cancelled", "final_sent", "phase",
+                 "hit_cap", "prompt_len")
 
-    def __init__(self, tokens: list[str]) -> None:
+    def __init__(self, tokens: list[str], hit_cap: bool, prompt_len: int) -> None:
         self.tokens = tokens
         self.index = 0
         self.cancelled = False
         self.final_sent = False
+        self.phase = 0  # 0/1: the two prefill steps, 2: decoding
+        self.hit_cap = hit_cap
+        self.prompt_len = prompt_len
 
 
 class FakeEngine:
     def __init__(self, model_dir: str = "/tmp/fake-model", script: Optional[str] = None,
                  delay: float = 0.0, n_ctx: int = 32768,
                  draft_stats: Optional[tuple[int, int]] = None,
-                 fail_on_token: Optional[int] = None) -> None:
+                 fail_on_token: Optional[int] = None,
+                 cached_tokens: int = 0, think_prompt: bool = True,
+                 prefill_progress: Optional[tuple[int, int]] = None,
+                 engine_version: str = "1.5.0",
+                 engine_args: Optional[list[str]] = None) -> None:
         self.model_dir = model_dir
         self.script = script            # pinned script; None -> derive from the prompt
         self.delay = delay              # seconds slept once per iterate() call
         self.n_ctx = n_ctx
+        self.think_prompt = think_prompt
+        self.prefill_progress = prefill_progress
+        self.fail_on_token = fail_on_token
         # Figures reported on the eos result (spec'd example values).
         self.prompt_tokens = 24
+        self.cached_tokens = cached_tokens
         self.time_prefill = 0.5
         self.sec_per_token = 0.04
         self.draft_stats = draft_stats  # (accepted, rejected) or None
-        self.fail_on_token = fail_on_token
         # Observability for tests.
         self.jobs: list[FakeJob] = []
         self.records: list[dict] = []   # one dict per submit() call
         self.peak_active = 0
         self._vocab: dict[str, int] = {}
         self._rev: dict[int, str] = {}
+        engine = engine_info.build_engine_block(
+            "exllamav3", engine_version,
+            engine_args if engine_args is not None else engine_info.engine_args(sys.argv[1:]),
+            model_dir=model_dir)
         self.props: dict = {
             "model_path": os.path.abspath(model_dir),
             "chat_template": MINIMAL_CHAT_TEMPLATE,
             "n_ctx": n_ctx,
             "exllamav3_version": None,
             "alias": None,
+            "engine": engine,
         }
 
     # -- Engine protocol --------------------------------------------------
@@ -78,7 +129,8 @@ class FakeEngine:
         out = []
         for m in messages:
             out.append(f"<|{m.get('role', 'user')}|>\n{m.get('content') or ''}\n")
-        out.append("<|assistant|>\n")
+        # the target model's template ends '<|assistant|><think>'
+        out.append("<|assistant|><think>" if self.think_prompt else "<|assistant|>\n")
         return "".join(out)
 
     def encode(self, text: str) -> list[int]:
@@ -96,14 +148,18 @@ class FakeEngine:
         return " ".join(self._rev.get(i, "?") for i in ids)
 
     def submit(self, ids: list[int], max_new_tokens: int,
-               temperature: Optional[float], stop: Optional[list[str]]) -> Any:
+               sampling: Optional[dict], stop: Optional[list[str]]) -> Any:
         self.records.append({
             "ids_len": len(ids),
             "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
+            "sampling": dict(sampling or {}),
             "stop": list(stop or []),
         })
-        job = FakeJob(self._script_for(ids, max_new_tokens))
+        text = self.script if self.script is not None else self._script_text(ids)
+        all_tokens = tokenize(text)
+        hit_cap = max_new_tokens is not None and len(all_tokens) > max_new_tokens
+        tokens = all_tokens[:max_new_tokens] if hit_cap else all_tokens
+        job = FakeJob(tokens, hit_cap, len(ids))
         self.jobs.append(job)
         self.peak_active = max(self.peak_active, len(self.jobs))
         return job
@@ -116,24 +172,38 @@ class FakeEngine:
             time.sleep(self.delay)
         results = []
         for job in list(self.jobs):
-            if self.fail_on_token is not None and job.index == self.fail_on_token:
+            if (self.fail_on_token is not None and job.phase == 2
+                    and job.index == self.fail_on_token):
                 self.jobs = []  # engine "crashed": nothing stays runnable
                 raise RuntimeError(f"fake engine injected failure at token {self.fail_on_token}")
             if job.cancelled:
-                results.append(self._final(job))
+                results.append(self._final(job, "cancelled"))
                 continue
-            if job.index < len(job.tokens):
+            if job.phase == 0:
+                job.phase = 1
+                results.append({"stage": "prefill", "serial": 0,
+                                "eos": False, "job": job})
+            elif job.phase == 1:
+                job.phase = 2
+                curr, mx = self._progress_for(job)
+                results.append({"stage": "prefill", "serial": 0, "eos": False,
+                                "job": job, "curr_progress": curr,
+                                "max_progress": mx})
+            elif job.index < len(job.tokens):
                 token = job.tokens[job.index]
                 job.index += 1
-                res = {"text": token, "eos": False, "job": job}
+                res = {"stage": "streaming", "serial": job.index, "eos": False,
+                       "job": job, "text": token, "token_ids": [5000 + job.index]}
                 if job.index == len(job.tokens):
                     # last token rides on the final result, like exllamav3
-                    res.update(self._figures(job.index))
+                    res.update(self._figures(job.index,
+                                             "max_new_tokens" if job.hit_cap else "eos"))
                     res["eos"] = True
+                    res["full_completion"] = "".join(job.tokens)
                     job.final_sent = True
                 results.append(res)
             elif not job.final_sent:  # max_new_tokens == 0
-                results.append(self._final(job))
+                results.append(self._final(job, "eos"))
         self.jobs = [j for j in self.jobs if not j.final_sent]
         return results
 
@@ -142,33 +212,43 @@ class FakeEngine:
 
     # -- internals ----------------------------------------------------------
 
-    def _script_for(self, ids: list[int], max_new_tokens: Optional[int]) -> list[str]:
-        if self.script is not None:
-            text = self.script
-        else:
-            words = self.decode(ids)
-            m = re.search(r"<\|user\|>\s*(.*?)\s*<\|assistant\|>", words)
-            topic = (m.group(1) if m else "this").strip() or "this"
-            text = (f"<think>The fake model thinks about {topic}.</think>"
+    def _script_text(self, ids: list[int]) -> str:
+        words = self.decode(ids)
+        m = re.search(r"<\|user\|>\s*(.*?)\s*<\|assistant\|>", words)
+        topic = (m.group(1) if m else "this").strip() or "this"
+        if self.think_prompt:
+            # the prompt already opened the think block
+            return (f"The fake model thinks about {topic}.</think>"
                     f"The fake model answers {topic}.")
-        tokens = list(text)
-        if max_new_tokens is not None:
-            tokens = tokens[:max_new_tokens]
-        return tokens
+        return (f"<think>The fake model thinks about {topic}.</think>"
+                f"The fake model answers {topic}.")
 
-    def _figures(self, emitted: int) -> dict:
+    def _progress_for(self, job: FakeJob) -> tuple[int, int]:
+        if self.prefill_progress is not None:
+            return self.prefill_progress
+        mx = max(job.prompt_len, 1)
+        return mx - max(1, mx // 5), mx
+
+    def _figures(self, emitted: int, eos_reason: Optional[str] = None) -> dict:
         fig = {
             "new_tokens": emitted,
             "prompt_tokens": self.prompt_tokens,
+            "cached_tokens": self.cached_tokens,
+            "cached_pages": 0,
+            "time_enqueued": 0.0005,
             "time_prefill": self.time_prefill,
             "time_generate": emitted * self.sec_per_token,
         }
+        if eos_reason is not None:
+            fig["eos_reason"] = eos_reason
         if self.draft_stats is not None:
             fig["accepted_draft_tokens"], fig["rejected_draft_tokens"] = self.draft_stats
         return fig
 
-    def _final(self, job: FakeJob) -> dict:
+    def _final(self, job: FakeJob, eos_reason: str) -> dict:
         job.final_sent = True
-        res = {"text": "", "eos": True, "job": job}
-        res.update(self._figures(job.index))
+        res = {"stage": "streaming", "serial": job.index, "text": "",
+               "token_ids": [], "eos": True, "job": job,
+               "full_completion": "".join(job.tokens[:job.index])}
+        res.update(self._figures(job.index, eos_reason))
         return res

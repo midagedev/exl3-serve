@@ -28,72 +28,63 @@ from . import __version__
 
 
 # --------------------------------------------------------------------------
-# think-split: streaming <think>...</think> handling across token boundaries
+# think-split: token-level <think>...</think> handling
 # --------------------------------------------------------------------------
 
 class ThinkSplitter:
-    """Splits raw generated text into reasoning (inside ``<think>...</think>``)
-    and content. Tags may arrive split across any number of deltas; ambiguous
-    tails are buffered until they are disambiguated or the stream ends."""
+    """Splits generated tokens into reasoning (inside ``<think>...</think>``)
+    and content. The tags are single tokens for this model class, so the
+    split works per token and nothing is buffered: a token whose stripped
+    text is exactly a tag switches mode and emits nothing, and a token with
+    an embedded ``</think>`` emits one delta carrying both sides.
+
+    The splitter starts in think mode when the rendered prompt ends with
+    ``<think>`` (this model's template opens the think block itself, and the
+    reply closes it later without ever emitting ``<think>``)."""
 
     START = "<think>"
     END = "</think>"
-    _MAX_LEAD = len(START) + 16  # runaway whitespace before a possible tag
 
-    def __init__(self) -> None:
-        self.mode = "start"  # start -> think -> content
-        self.buf = ""
+    def __init__(self, prompt: str = "") -> None:
+        self.mode = "think" if prompt.rstrip().endswith(self.START) else "start"
 
-    def feed(self, text: str) -> list[tuple[str, str]]:
-        self.buf += text
-        out: list[tuple[str, str]] = []
-        while True:
-            if self.mode == "start":
-                stripped = self.buf.lstrip()
-                if stripped.startswith(self.START):
-                    self.buf = stripped[len(self.START):]
-                    self.mode = "think"
-                    continue
-                if self.START.startswith(stripped) and len(self.buf) <= self._MAX_LEAD:
-                    break  # still ambiguous, keep buffering
-                out.append(("content", self.buf))
-                self.buf = ""
-                self.mode = "content"
-                break
+    def feed_token(self, text: str) -> Optional[dict]:
+        """One token's text -> its delta dict, or None when the token emits
+        nothing (a pure tag token). Only non-empty sides are included."""
+        stripped = text.strip()
+        if stripped == self.START:
+            self.mode = "think"
+            return None
+        if stripped == self.END:
             if self.mode == "think":
-                idx = self.buf.find(self.END)
-                if idx >= 0:
-                    if idx:
-                        out.append(("reasoning", self.buf[:idx]))
-                    self.buf = self.buf[idx + len(self.END):]
-                    self.mode = "content"
-                    continue
-                keep = len(self.END) - 1  # hold a tail that may complete the tag
-                if len(self.buf) > keep:
-                    out.append(("reasoning", self.buf[:-keep]))
-                    self.buf = self.buf[-keep:]
-                break
-            out.append(("content", self.buf))
-            self.buf = ""
-            break
-        return out
-
-    def flush(self) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
+                self.mode = "content"
+            return None  # a stray closer outside a think block emits nothing
         if self.mode == "think":
-            # unterminated think block: everything buffered is reasoning
-            if self.buf:
-                out.append(("reasoning", self.buf))
-        elif self.buf:
-            out.append(("content", self.buf))
-        self.buf = ""
-        self.mode = "content"
-        return out
+            if self.END in text:
+                before, after = text.split(self.END, 1)
+                self.mode = "content"
+                delta: dict = {}
+                if before:
+                    delta["reasoning_content"] = before
+                if after:
+                    delta["content"] = after
+                return delta or None
+            return {"reasoning_content": text}
+        if self.mode == "start":
+            self.mode = "content"
+        return {"content": text}
 
 
 def timings_from_engine(res: dict) -> dict:
-    """The timings object, from the engine's final (eos) result."""
-    prompt_n = res.get("prompt_tokens") or 0
+    """The timings object, from the engine's final (eos) result.
+
+    llama-server counts only the newly prefilled tokens: ``prompt_n`` is
+    ``prompt_tokens`` minus ``cached_tokens`` and ``prompt_per_second`` is
+    over that. A missing ``cached_tokens`` counts as 0 in the arithmetic and
+    is omitted from the output rather than zeroed.
+    """
+    cached = res.get("cached_tokens")
+    prompt_n = (res.get("prompt_tokens") or 0) - (cached or 0)
     prompt_s = res.get("time_prefill") or 0.0
     pred_n = res.get("new_tokens") or 0
     pred_s = res.get("time_generate") or 0.0
@@ -104,8 +95,9 @@ def timings_from_engine(res: dict) -> dict:
         "predicted_n": pred_n,
         "predicted_ms": pred_s * 1000.0,
         "predicted_per_second": (pred_n / pred_s) if pred_s > 0 else 0.0,
-        "cache_n": 0,  # no prefix cache in this cut
     }
+    if cached is not None:
+        t["cache_n"] = cached
     accepted = res.get("accepted_draft_tokens")
     rejected = res.get("rejected_draft_tokens")
     if accepted is not None and rejected is not None:
@@ -154,9 +146,9 @@ class Dispatcher:
         return await self._call(lambda: self.engine.encode(text))
 
     async def submit(self, rec: GenRecord, ids: list[int], max_new_tokens: int,
-                     temperature: Optional[float], stop: Optional[list[str]]) -> Any:
+                     sampling: dict, stop: Optional[list[str]]) -> Any:
         def _do() -> Any:
-            job = self.engine.submit(ids, max_new_tokens, temperature, stop)
+            job = self.engine.submit(ids, max_new_tokens, sampling, stop)
             rec.job = job
             self.routes[job] = rec  # registered atomically with the enqueue
             return job
@@ -255,6 +247,7 @@ class AppState:
         self.model_path = ""
         self.chat_template = ""
         self.exl3_version: Optional[str] = None
+        self.engine_block: Optional[dict] = None
         self.n_ctx = 0
         self._id_counter = itertools.count(1)
         self._load_task: Optional[asyncio.Task] = None
@@ -285,6 +278,7 @@ class AppState:
         self.model_path = props.get("model_path", "")
         self.chat_template = props.get("chat_template") or ""
         self.exl3_version = props.get("exllamav3_version")
+        self.engine_block = props.get("engine")
         try:
             self.n_ctx = int(props.get("n_ctx") or 0)
         except (TypeError, ValueError):
@@ -328,14 +322,17 @@ class AppState:
     async def handle_props(self, request: web.Request) -> web.Response:
         if self.engine is None:
             return _loading_response(self)
-        return web.json_response({
+        body = {
             # no build_info on purpose: toktape would mislabel us "llama-server
             # bNNNN"; the engine identifies itself in the Server header
             "model_path": self.model_path,
             "chat_template": self.chat_template,
             "total_slots": self.options.parallel,
             "default_generation_settings": {"n_ctx": self.n_ctx},
-        })
+        }
+        if self.engine_block is not None:
+            body["engine"] = self.engine_block
+        return web.json_response(body)
 
     async def handle_health(self, request: web.Request) -> web.Response:
         if self.engine is None:
@@ -408,7 +405,7 @@ class AppState:
         render_kw["add_generation_prompt"] = True
         prompt = self.engine.render_chat(**render_kw)
         ids = await self.dispatcher.encode(prompt)
-        gen = _Generation(self, slot, params, ids)
+        gen = _Generation(self, slot, params, ids, prompt)
         if params["stream"]:
             return await gen.stream(request)
         return await gen.collect()
@@ -471,6 +468,32 @@ def _parse_chat_request(body: dict, options: Options) -> tuple[Optional[dict], O
         temperature = float(temperature)
     p["temperature"] = temperature or None  # absent or 0 -> greedy
 
+    top_p = body.get("top_p")
+    if top_p is not None:
+        if isinstance(top_p, bool) or not isinstance(top_p, (int, float)):
+            return None, "'top_p' must be a number."
+        top_p = float(top_p)
+        if not (0.0 < top_p <= 1.0):
+            return None, "'top_p' must be in (0, 1]."
+    p["top_p"] = top_p
+
+    top_k = body.get("top_k")
+    if top_k is not None:
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            return None, "'top_k' must be an integer."
+        if top_k < 0:
+            return None, "'top_k' must be >= 0."
+    p["top_k"] = top_k
+
+    min_p = body.get("min_p")
+    if min_p is not None:
+        if isinstance(min_p, bool) or not isinstance(min_p, (int, float)):
+            return None, "'min_p' must be a number."
+        min_p = float(min_p)
+        if not (0.0 <= min_p <= 1.0):
+            return None, "'min_p' must be in [0, 1]."
+    p["min_p"] = min_p
+
     stop = body.get("stop")
     if stop is not None and isinstance(stop, str):
         stop = [stop]
@@ -510,25 +533,27 @@ def _parse_chat_request(body: dict, options: Options) -> tuple[Optional[dict], O
 # --------------------------------------------------------------------------
 
 class _Generation:
-    def __init__(self, st: AppState, slot: Slot, params: dict, ids: list[int]) -> None:
+    def __init__(self, st: AppState, slot: Slot, params: dict, ids: list[int],
+                 prompt: str) -> None:
         self.st = st
         self.slot = slot
         self.params = params
         self.ids = ids
         self.rec = GenRecord()
         self.splitter: Optional[ThinkSplitter] = (
-            None if st.options.no_think_split else ThinkSplitter())
+            None if st.options.no_think_split else ThinkSplitter(prompt))
         self.stop_strings: list[str] = params["stop"]
         self.max_tokens = params["max_tokens"]
-        self.raw = ""
-        self.raw_fed = 0
-        self.stop_pos = -1
         self._max_stop_len = max((len(s) for s in params["stop"]), default=0)
+        self.raw = ""
+        self.held: list[str] = []  # whole tokens held back for stop matching
+        self.released_end = 0      # chars of self.raw already emitted
+        self.stopped = False       # a stop string matched
+        self._last_cache = 0       # last engine-reported cached prompt length
         self.emitted = 0
         self.first_token_at: Optional[float] = None
         self.started_at = time.monotonic()
         self.figures: Optional[dict] = None  # the engine's final result
-        self.saw_eos = False
         self.engine_error: Optional[str] = None
         self.model = params["model"] or st.alias
         self.id = st.next_id()
@@ -536,48 +561,74 @@ class _Generation:
         self.reasoning_parts: list[str] = []
         self.content_parts: list[str] = []
 
-    # -- text plumbing --------------------------------------------------------
+    # -- token plumbing --------------------------------------------------------
 
-    def _feed_text(self, text: str) -> list[tuple[str, str]]:
-        """Accumulate raw text, drop everything past a stop string, split the rest.
+    def _stop_match(self) -> int:
+        best = -1
+        for s in self.stop_strings:
+            p = self.raw.find(s)
+            if p >= 0 and (best < 0 or p < best):
+                best = p
+        return best
 
-        While no stop string has matched, the last (longest stop - 1) characters
-        stay unfed: a stop string can complete across token boundaries, and text
-        that might yet turn out to be the start of one must not be streamed.
+    def _token_deltas(self, tok: str) -> list[dict]:
+        """One token -> at most one delta dict (carrying both think sides
+        when the token straddles the closing tag)."""
+        if self.splitter is None:
+            return [{"content": tok}] if tok else []
+        delta = self.splitter.feed_token(tok)
+        return [delta] if delta else []
+
+    def _process_token(self, text: str) -> list[dict]:
+        """Feed one token's text; return the deltas to emit.
+
+        The stop-string hold-back releases **whole tokens**: a token stays
+        queued until no stop string starting inside it can still complete
+        (its end is followed by max_stop_len - 1 characters of raw text).
+        When a stop string matches, everything before it is emitted -- the
+        queued whole tokens, then the straddling token's prefix as one chunk
+        -- and the rest is dropped.
         """
+        if self.stopped or not text:
+            return []
+        deltas: list[dict] = []
         self.raw += text
-        limit = len(self.raw)
-        if self.stop_strings and self.stop_pos < 0:
-            best = -1
-            for s in self.stop_strings:
-                p = self.raw.find(s)
-                if p >= 0 and (best < 0 or p < best):
-                    best = p
-            if best >= 0:
-                self.stop_pos = best
-                limit = best
-        chunk = self.raw[self.raw_fed:limit]
-        if self.stop_pos < 0 and self._max_stop_len > 1:
-            hold = self._max_stop_len - 1
-            chunk = chunk[:max(0, len(chunk) - hold)]
-        self.raw_fed += len(chunk)
-        if not chunk:
-            return []
-        if self.splitter is not None:
-            return self.splitter.feed(chunk)
-        return [("content", chunk)]
+        if self.stop_strings:
+            pos = self._stop_match()
+            if pos >= 0:
+                self.stopped = True
+                prefix = self.raw[:pos]
+                while self.held and self.released_end + len(self.held[0]) <= len(prefix):
+                    tok = self.held.pop(0)
+                    self.released_end += len(tok)
+                    deltas.extend(self._token_deltas(tok))
+                rem = prefix[self.released_end:]
+                if rem:
+                    deltas.extend(self._token_deltas(rem))
+                return deltas
+        self.held.append(text)
+        while self.held and (self._max_stop_len <= 1
+                             or self.released_end + len(self.held[0]) - 1
+                             + self._max_stop_len <= len(self.raw)):
+            tok = self.held.pop(0)
+            self.released_end += len(tok)
+            deltas.extend(self._token_deltas(tok))
+        return deltas
 
-    def _flush_tail(self) -> list[tuple[str, str]]:
-        """Feed the held-back tail at finish time (it never became a stop string)."""
-        if self.stop_pos >= 0:
+    def _flush_held(self) -> list[dict]:
+        """Emit the queued whole tokens at finish time (no stop matched).
+
+        After a stop match the straddling token is still queued -- only its
+        pre-stop prefix was emitted -- and must stay dropped, not flushed.
+        """
+        if self.stopped:
             return []
-        chunk = self.raw[self.raw_fed:]
-        self.raw_fed = len(self.raw)
-        if not chunk:
-            return []
-        if self.splitter is not None:
-            return self.splitter.feed(chunk)
-        return [("content", chunk)]
+        deltas: list[dict] = []
+        while self.held:
+            tok = self.held.pop(0)
+            self.released_end += len(tok)
+            deltas.extend(self._token_deltas(tok))
+        return deltas
 
     # -- timings / usage ---------------------------------------------------------
 
@@ -596,7 +647,6 @@ class _Generation:
             "predicted_n": n,
             "predicted_ms": ms,
             "predicted_per_second": per_s,
-            "cache_n": 0,
         }
 
     def _final_timings(self) -> dict:
@@ -613,19 +663,27 @@ class _Generation:
         completion_n = (self.figures or {}).get("new_tokens")
         if completion_n is None:
             completion_n = self.emitted
-        return {
+        usage = {
             "prompt_tokens": prompt_n,
             "completion_tokens": completion_n,
             "total_tokens": prompt_n + completion_n,
-            "prompt_tokens_details": {"cached_tokens": 0},
         }
+        cached = (self.figures or {}).get("cached_tokens")
+        if cached is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached}
+        return usage
 
     def _finish_reason(self) -> str:
-        if self.stop_pos >= 0:
+        if self.stopped:
             return "stop"
-        if self.saw_eos and self.emitted < self.max_tokens:
+        if (self.figures or {}).get("eos_reason") == "max_new_tokens":
+            return "length"
+        if self.figures is not None:
             return "stop"
-        return "length"
+        # no final result arrived (cancel path): fall back to the cap
+        if self.emitted >= self.max_tokens:
+            return "length"
+        return "stop"
 
     def _chunk(self, delta: Optional[dict] = None, finish_reason: Optional[str] = None,
                extra: Optional[dict] = None) -> dict:
@@ -642,41 +700,44 @@ class _Generation:
             obj.update(extra)
         return obj
 
-    @staticmethod
-    def _delta_for(dest: str, seg: str) -> dict:
-        return {"content": seg} if dest == "content" else {"reasoning_content": seg}
-
     # -- the shared generation loop ---------------------------------------------
 
     async def _drive(self, emit: Callable) -> None:
         st = self.st
         p = self.params
         if p["return_progress"]:
-            await emit("progress", 0)
+            await emit("progress", 0, 0)  # the submission chunk
+        sampling = {"temperature": p["temperature"], "top_p": p.get("top_p"),
+                    "top_k": p.get("top_k"), "min_p": p.get("min_p")}
         job = await st.dispatcher.submit(
-            self.rec, self.ids, self.max_tokens, p["temperature"], p["stop"])
+            self.rec, self.ids, self.max_tokens, sampling, p["stop"])
         try:
             while True:
                 res = await self.rec.queue.get()
                 if "engine_error" in res:
                     self.engine_error = res["engine_error"]
                     return
-                text = res.get("text", "")
+                if (p["return_progress"] and self.first_token_at is None
+                        and isinstance(res.get("curr_progress"), int)
+                        and isinstance(res.get("max_progress"), int)):
+                    total = len(self.ids)
+                    cache = max(0, total - res["max_progress"])
+                    self._last_cache = cache
+                    await emit("progress", cache, cache + res["curr_progress"])
+                text = res.get("text") or ""
                 if text:
                     self.emitted += 1
                     self.slot.n_past = len(self.ids) + self.emitted
                     if self.first_token_at is None:
                         self.first_token_at = time.monotonic()
                         if p["return_progress"]:
-                            # exllamav3 does not report prefill progress
-                            # incrementally: one chunk now that it is done
-                            await emit("progress", len(self.ids))
-                    for dest, seg in self._feed_text(text):
-                        await emit("delta", dest, seg)
-                    if self.stop_pos >= 0:
+                            # prefill is done once tokens flow: final chunk
+                            await emit("progress", self._last_cache, len(self.ids))
+                    for delta in self._process_token(text):
+                        await emit("delta", delta)
+                    if self.stopped:
                         if res.get("eos"):
                             self.figures = res
-                            self.saw_eos = True
                             return
                         await st.dispatcher.cancel(job)
                         # the fake engine still reports final figures after a
@@ -696,7 +757,6 @@ class _Generation:
                         return
                 if res.get("eos"):
                     self.figures = res
-                    self.saw_eos = True
                     return
         finally:
             if self.figures is None and self.rec.job is not None:
@@ -735,7 +795,7 @@ class _Generation:
 
         async def emit(kind: str, *args: Any) -> None:
             if kind == "progress":
-                processed = args[0]
+                cache, processed = args
                 await send({
                     "id": self.id,
                     "object": "chat.completion.chunk",
@@ -744,16 +804,16 @@ class _Generation:
                     "id_slot": self.slot.id,
                     "prompt_progress": {
                         "total": len(self.ids),
-                        "cache": 0,
+                        "cache": cache,
                         "processed": processed,
                         "time_ms": (time.monotonic() - self.started_at) * 1000.0,
                     },
                 })
-            elif kind == "delta":
-                dest, seg = args
+            else:  # "delta": exactly one chunk per emitted token
+                (delta,) = args
                 extra = ({"timings": self._provisional_timings()}
                          if p["timings_per_token"] else None)
-                await send(self._chunk(delta=self._delta_for(dest, seg), extra=extra))
+                await send(self._chunk(delta=delta, extra=extra))
 
         await send(self._chunk(delta={"role": "assistant", "content": ""}))
         await self._drive(emit)
@@ -763,15 +823,10 @@ class _Generation:
                                       "type": "server_error"}})
                 await resp.write(b"data: [DONE]\n\n")
                 return resp
-            for dest, seg in self._flush_tail():
+            for delta in self._flush_held():
                 extra = ({"timings": self._provisional_timings()}
                          if p["timings_per_token"] else None)
-                await send(self._chunk(delta=self._delta_for(dest, seg), extra=extra))
-            tail = self.splitter.flush() if self.splitter is not None else []
-            for dest, seg in tail:
-                extra = ({"timings": self._provisional_timings()}
-                         if p["timings_per_token"] else None)
-                await send(self._chunk(delta=self._delta_for(dest, seg), extra=extra))
+                await send(self._chunk(delta=delta, extra=extra))
             final = self._chunk(finish_reason=self._finish_reason(),
                                 extra={"timings": self._final_timings()})
             if p["include_usage"]:
@@ -788,17 +843,20 @@ class _Generation:
         async def emit(kind: str, *args: Any) -> None:
             if kind == "progress":
                 return  # prompt_progress is a streaming-only feature
-            dest, seg = args
-            (self.reasoning_parts if dest == "reasoning" else self.content_parts).append(seg)
+            (delta,) = args
+            if "reasoning_content" in delta:
+                self.reasoning_parts.append(delta["reasoning_content"])
+            if "content" in delta:
+                self.content_parts.append(delta["content"])
 
         await self._drive(emit)
         if self.engine_error is not None:
             return _error(500, self.engine_error, "server_error")
-        for dest, seg in self._flush_tail():
-            (self.reasoning_parts if dest == "reasoning" else self.content_parts).append(seg)
-        tail = self.splitter.flush() if self.splitter is not None else []
-        for dest, seg in tail:
-            (self.reasoning_parts if dest == "reasoning" else self.content_parts).append(seg)
+        for delta in self._flush_held():
+            if "reasoning_content" in delta:
+                self.reasoning_parts.append(delta["reasoning_content"])
+            if "content" in delta:
+                self.content_parts.append(delta["content"])
         message: dict = {"role": "assistant", "content": "".join(self.content_parts)}
         if self.reasoning_parts:
             message["reasoning_content"] = "".join(self.reasoning_parts)
