@@ -205,6 +205,14 @@ async def test_props_engine_block(tmp_path):
     assert values and all(v != 0 for v in values)  # measured, never placeholder
 
 
+async def test_props_engine_draft_from_engine():
+    eng = FakeEngine(engine_draft={"model": "mtp", "n_max": 1})
+    async with serve(engine=eng) as client:
+        r = await client.get("/props")
+        b = await r.json()
+        assert b["engine"]["draft"] == {"model": "mtp", "n_max": 1}
+
+
 async def test_props_engine_omitted_when_engine_has_none():
     eng = FakeEngine()
     del eng.props["engine"]

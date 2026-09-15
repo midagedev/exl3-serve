@@ -225,6 +225,12 @@ class Exl3Engine:
         engine_block = engine_info.build_engine_block(
             "exllamav3", version, engine_info.engine_args(sys.argv[1:]),
             model_dir=args.model_dir)
+        if draft_model is not None:
+            draft = engine_info.draft_block(
+                bool(getattr(args, "mtp", False)), getattr(args, "draft_model_dir", None),
+                getattr(args, "draft_n", None))  # what the Generator above was given
+            if draft is not None:
+                engine_block["draft"] = draft
         placement = cls._measure_placement(model, draft_model, config,
                                            cache, draft_cache)
         if placement is not None:

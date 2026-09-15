@@ -90,7 +90,8 @@ class FakeEngine:
                  cached_tokens: int = 0, think_prompt: bool = True,
                  prefill_progress: Optional[tuple[int, int]] = None,
                  engine_version: str = "1.5.0",
-                 engine_args: Optional[list[str]] = None) -> None:
+                 engine_args: Optional[list[str]] = None,
+                 engine_draft: Optional[dict] = None) -> None:
         self.model_dir = model_dir
         self.script = script            # pinned script; None -> derive from the prompt
         self.delay = delay              # seconds slept once per iterate() call
@@ -114,6 +115,8 @@ class FakeEngine:
             "exllamav3", engine_version,
             engine_args if engine_args is not None else engine_info.engine_args(sys.argv[1:]),
             model_dir=model_dir)
+        if engine_draft is not None:
+            engine["draft"] = dict(engine_draft)
         self.props: dict = {
             "model_path": os.path.abspath(model_dir),
             "chat_template": MINIMAL_CHAT_TEMPLATE,

@@ -325,6 +325,23 @@ def engine_args(argv: list[str]) -> list[str]:
     return out
 
 
+def draft_block(mtp: bool, draft_model_dir: Optional[str],
+                n_max: Optional[int]) -> Optional[dict]:
+    """``engine.draft``: ``model`` is "mtp" for the model's own MTP head, else the
+    draft model directory's name; ``n_max`` is the most tokens drafted per step as
+    the server configured the generator (omitted when it left the engine default).
+    None when no draft is configured."""
+    if mtp:
+        block: dict = {"model": "mtp"}
+    elif draft_model_dir:
+        block = {"model": os.path.basename(os.path.normpath(draft_model_dir))}
+    else:
+        return None
+    if isinstance(n_max, int) and not isinstance(n_max, bool) and n_max > 0:
+        block["n_max"] = n_max
+    return block
+
+
 def build_engine_block(name: str, version: Optional[str], args: Any,
                        model_dir: Optional[str] = None) -> dict:
     """The ``/props`` ``engine`` object: identity plus the disk-measured

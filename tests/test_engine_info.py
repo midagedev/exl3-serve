@@ -267,3 +267,13 @@ def test_engine_args_drop_non_behavioural_flags():
     assert engine_info.engine_args(argv) == [
         "-gs", "44,21", "-mcs", "185", "-mct", "32", "-cs", "32768", "-mtp",
         "--draft-n", "1", "--parallel", "2"]
+
+
+def test_draft_block():
+    """engine.draft fills the card's Draft row: the model verbatim ("mtp" for the
+    model's own MTP head, else the draft model directory's name) and n_max, the
+    most tokens drafted per step, omitted when the server does not set it."""
+    assert engine_info.draft_block(True, None, 1) == {"model": "mtp", "n_max": 1}
+    assert engine_info.draft_block(False, "/models/Some-Draft-exl3/", 4) == {"model": "Some-Draft-exl3", "n_max": 4}
+    assert engine_info.draft_block(True, None, None) == {"model": "mtp"}
+    assert engine_info.draft_block(False, None, 3) is None
