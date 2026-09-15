@@ -129,8 +129,10 @@ to 4.6 s — rather than throughput. The full write-up, with the tapes, is in
   zeroed.
 - One engine thread: prompt encoding waits behind in-flight decode steps.
 - `messages[*].content` must be a string or null — no multimodal parts.
-- A `stop` string that cancels a job leaves the engine with no final result, so
-  that one chunk falls back to wall-clock timings.
+- A cancelled job — a `stop` string, or a client that goes away — never gets
+  the engine's own eos figures, so that chunk's `timings` are this server's
+  wall clock: prefill is submission to the first token, decode is the first
+  token to the last.
 - While the model loads, everything answers 503 with the reason in it.
 
 ## Why Python

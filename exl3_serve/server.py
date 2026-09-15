@@ -640,10 +640,23 @@ class _Generation:
             sec = max(time.monotonic() - self.first_token_at, 1e-9)
             ms = sec * 1000.0
             per_s = n / sec
+        # The engine reports its own prefill time only in the eos result, so
+        # until then -- and for good on a cancelled job -- the prefill figure
+        # is this server's wall clock from submission to the first token. It is
+        # the honest number for a request that never finished: leaving it 0 said
+        # a 274-token prefill took no time (measured 2026-09-15, a run cut by
+        # the recorder's clock).
+        prompt_ms = 0.0
+        prompt_per_s = 0.0
+        prompt_n = len(self.ids)
+        if self.first_token_at is not None:
+            prompt_ms = max(self.first_token_at - self.started_at, 0.0) * 1000.0
+            if prompt_ms > 0.0:
+                prompt_per_s = prompt_n / (prompt_ms / 1000.0)
         return {
-            "prompt_n": len(self.ids),  # measured at encode time
-            "prompt_ms": 0.0,           # engine reports prefill only at the end
-            "prompt_per_second": 0.0,
+            "prompt_n": prompt_n,       # measured at encode time
+            "prompt_ms": prompt_ms,
+            "prompt_per_second": prompt_per_s,
             "predicted_n": n,
             "predicted_ms": ms,
             "predicted_per_second": per_s,

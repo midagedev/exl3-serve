@@ -566,7 +566,12 @@ async def test_timings_per_token_provisional_then_final():
                  and "timings" in c]
         assert len(timed) == 9  # 8 content chunks + final
         provs, final = timed[:-1], timed[-1]
-        assert all(p["timings"]["prompt_ms"] == 0.0 for p in provs)  # unknown until eos
+        # Provisional prefill is this server's wall clock from submission to the
+        # first token, not 0: a run the client cuts never gets the engine's eos
+        # figure, and 0 claimed a long prefill took no time (contract changed
+        # 2026-09-15 after a recorder's clock cut a 274-token prefill).
+        assert all(0.0 < p["timings"]["prompt_ms"] < 500.0 for p in provs)
+        assert all(p["timings"]["prompt_per_second"] > 0.0 for p in provs)
         assert all(0.0 <= p["timings"]["predicted_ms"] < 200.0 for p in provs)  # wall clock
         assert final["timings"]["predicted_ms"] == pytest.approx(8 * 0.04 * 1000)
         assert final["timings"]["prompt_ms"] == pytest.approx(500.0)  # replaced
