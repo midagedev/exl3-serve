@@ -80,27 +80,39 @@ def _walk_roots(root: Any):
         stack.extend(getattr(m, "modules", []) or [])
 
 
+def _tensor_key(t: Any) -> tuple:
+    """Identity of a tensor's bytes: start address, byte length, device. Two
+    views of the same bytes count once; two tensors sharing one storage do not
+    collapse into each other."""
+    return (t.data_ptr(), t.numel() * t.element_size(), str(t.device))
+
+
 def _measure_weights(model: Any, draft_model: Any) -> dict[str, dict[str, int]]:
     """Per-device, per-class byte counts of the resident weights (main model
-    and MTP model), storages deduped by (data_ptr, device) so shared or
-    re-viewed tensors count once."""
+    and MTP model): each tensor's own bytes (numel x element size), deduped by
+    (data_ptr, nbytes, device).
+
+    Not the storage size: the loader packs weights into shared 128 MiB chunks,
+    so ``untyped_storage().nbytes()`` gave a whole chunk to whichever tensor the
+    walk met first -- an 8 KB norm weight was credited 0.125 GiB and the class
+    split followed walk order (2026-09-15 class probe). Chunk slack is not a
+    weight and is not counted."""
     import torch
 
     by: dict[str, dict[str, int]] = {}
     for root in (model, draft_model):
         if root is None:
             continue
-        stor: set[tuple] = set()
+        seen: set[tuple] = set()
         for m in _walk_roots(root):
             key = getattr(m, "key", "") or ""
             for t in _tensors_of(m):
                 if not isinstance(t, torch.Tensor):
                     continue
-                st = t.untyped_storage()
-                sid = (st.data_ptr(), str(t.device))
-                if sid in stor:
+                tk = _tensor_key(t)
+                if tk in seen:
                     continue
-                stor.add(sid)
+                seen.add(tk)
                 d = by.setdefault(str(t.device), {})
                 # A sparse MoE module's own tensors (key "...layers.N.mlp") are expert
                 # data -- the fused/per-expert buffers it keeps -- not dense ffn: the
@@ -108,7 +120,7 @@ def _measure_weights(model: Any, draft_model: Any) -> dict[str, dict[str, int]]:
                 # against 1.2 GB of dense ffn + shared + router on disk.
                 cls = ("experts" if hasattr(m, "num_experts")
                        else engine_info.classify_tensor(key))
-                d[cls] = d.get(cls, 0) + st.nbytes()
+                d[cls] = d.get(cls, 0) + tk[1]
     return by
 
 
@@ -136,8 +148,8 @@ def _cpu_expert_bytes(model: Any, config: Any) -> Optional[int]:
 
 
 def _cache_bytes(caches: tuple) -> Optional[int]:
-    """Bytes of the cache and draft-cache tensors on cuda:* devices,
-    storages deduped."""
+    """Bytes of the cache and draft-cache tensors on cuda:* devices, each
+    tensor's own bytes, deduped like the weights."""
     import torch
 
     total = 0
@@ -146,18 +158,17 @@ def _cache_bytes(caches: tuple) -> Optional[int]:
         if layers is None:
             continue
         items = layers.values() if isinstance(layers, dict) else layers
-        stor: set[tuple] = set()
+        seen: set[tuple] = set()
         for layer in items:
             for t in _tensors_of(layer):
                 if not isinstance(t, torch.Tensor):
                     continue
-                st = t.untyped_storage()
-                sid = (st.data_ptr(), str(t.device))
-                if sid in stor:
+                tk = _tensor_key(t)
+                if tk in seen:
                     continue
-                stor.add(sid)
+                seen.add(tk)
                 if str(t.device).startswith("cuda"):
-                    total += st.nbytes()
+                    total += tk[1]
     return total
 
 
