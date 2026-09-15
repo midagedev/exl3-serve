@@ -131,8 +131,11 @@ to 4.6 s — rather than throughput. The full write-up, with the tapes, is in
 - `messages[*].content` must be a string or null — no multimodal parts.
 - A cancelled job — a `stop` string, or a client that goes away — never gets
   the engine's own eos figures, so that chunk's `timings` are this server's
-  wall clock: prefill is submission to the first token, decode is the first
-  token to the last.
+  wall clock: prefill is measured from the moment the job reached the engine
+  to the first token (not from when the request arrived, so a recorder
+  subtracting it from TTFT does not count the queue twice), decode from the
+  first token to the last. A finished job always carries the engine's own
+  figures instead.
 - While the model loads, everything answers 503 with the reason in it.
 
 ## Why Python

@@ -553,6 +553,7 @@ class _Generation:
         self.emitted = 0
         self.first_token_at: Optional[float] = None
         self.started_at = time.monotonic()
+        self.submitted_at: Optional[float] = None  # when the job reached the engine
         self.figures: Optional[dict] = None  # the engine's final result
         self.engine_error: Optional[str] = None
         self.model = params["model"] or st.alias
@@ -641,16 +642,18 @@ class _Generation:
             ms = sec * 1000.0
             per_s = n / sec
         # The engine reports its own prefill time only in the eos result, so
-        # until then -- and for good on a cancelled job -- the prefill figure
-        # is this server's wall clock from submission to the first token. It is
-        # the honest number for a request that never finished: leaving it 0 said
-        # a 274-token prefill took no time (measured 2026-09-15, a run cut by
-        # the recorder's clock).
+        # until then -- and for good on a cancelled job -- the prefill figure is
+        # this server's wall clock. It is measured from the moment the job
+        # reached the engine, not from when the request arrived: a recorder
+        # subtracts this from its TTFT to show the wait before prefill, so a
+        # figure that contained that wait would be counted twice (measured
+        # 2026-09-15; leaving it 0 was worse, it said a 274-token prefill took
+        # no time).
         prompt_ms = 0.0
         prompt_per_s = 0.0
         prompt_n = len(self.ids)
-        if self.first_token_at is not None:
-            prompt_ms = max(self.first_token_at - self.started_at, 0.0) * 1000.0
+        if self.first_token_at is not None and self.submitted_at is not None:
+            prompt_ms = max(self.first_token_at - self.submitted_at, 0.0) * 1000.0
             if prompt_ms > 0.0:
                 prompt_per_s = prompt_n / (prompt_ms / 1000.0)
         return {
@@ -724,6 +727,7 @@ class _Generation:
                     "top_k": p.get("top_k"), "min_p": p.get("min_p")}
         job = await st.dispatcher.submit(
             self.rec, self.ids, self.max_tokens, sampling, p["stop"])
+        self.submitted_at = time.monotonic()
         try:
             while True:
                 res = await self.rec.queue.get()

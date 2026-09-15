@@ -566,10 +566,12 @@ async def test_timings_per_token_provisional_then_final():
                  and "timings" in c]
         assert len(timed) == 9  # 8 content chunks + final
         provs, final = timed[:-1], timed[-1]
-        # Provisional prefill is this server's wall clock from submission to the
-        # first token, not 0: a run the client cuts never gets the engine's eos
-        # figure, and 0 claimed a long prefill took no time (contract changed
-        # 2026-09-15 after a recorder's clock cut a 274-token prefill).
+        # Provisional prefill is this server's wall clock from the moment the job
+        # reached the engine to the first token, not 0 and not from when the
+        # request arrived: a recorder subtracts it from TTFT to show the wait
+        # before prefill, so a span containing that wait is counted twice
+        # (contract changed 2026-09-15 after a recorder's clock cut a 274-token
+        # prefill and the row read "? tok/s").
         assert all(0.0 < p["timings"]["prompt_ms"] < 500.0 for p in provs)
         assert all(p["timings"]["prompt_per_second"] > 0.0 for p in provs)
         assert all(0.0 <= p["timings"]["predicted_ms"] < 200.0 for p in provs)  # wall clock
