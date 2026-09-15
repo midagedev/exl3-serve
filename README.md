@@ -33,7 +33,13 @@ Every exllamav3 `model_init` flag is accepted verbatim (`-gs`, `-mcs`, `-mcl`,
 server flags are:
 
 - `--parallel N` — max concurrent streams (slots), default 2. Requests beyond
-  that wait for a slot; they are never rejected.
+  that wait for a slot; they are never rejected. exllamav3 sizes every cache
+  from `-ambs` (default 1) and the Generator clamps its batch to the cache's
+  slot count, so `load` raises `-ambs` to at least N before `model_init` and
+  then asserts the served batch: if it is still smaller the load fails with
+  both numbers rather than serving N slots that decode one at a time. Two real
+  slots need more VRAM than one — on a split with little headroom the load can
+  fail where `--parallel 1` fits, and a smaller `-cs` is the lever.
 - `--alias NAME` — model name reported to clients (default: model dir basename).
 - `--reasoning-effort` — server default for the chat-template kwarg (default
   `high`); requests override it via `chat_template_kwargs`.
@@ -176,4 +182,9 @@ nvidia-smi's numbering.
   return 503 with the loading error shape.
 - Huge `max_tokens` is clamped to `--max-tokens-cap` (4096 by default) rather
   than rejected.
+- Concurrency is for latency, not throughput, when the experts live in host
+  RAM: two streams each read their own experts, so the bytes a step moves
+  double with the tokens it produces. Measured on the workstation above, two
+  streams decoded 11.1 tok/s each against 22.0 for one, while the second
+  request's wait fell from 12.3 s to 4.6 s.
 
